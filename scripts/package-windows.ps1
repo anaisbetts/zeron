@@ -4,6 +4,19 @@ param(
 $ErrorActionPreference = 'Stop'
 if (-not $ReleasesUrl.StartsWith('https://')) { throw 'Release feed must use HTTPS' }
 $root = Split-Path $PSScriptRoot -Parent
+
+function Get-WindowsPackageArch {
+    # Match zeron-update's `std::env::consts::ARCH` so the standalone .exe
+    # name agrees with crates/update/src/windows.rs::artifact.
+    switch ([System.Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture) {
+        'X64' { 'x86_64' }
+        'Arm64' { 'aarch64' }
+        default {
+            throw "Unsupported Windows architecture: $([System.Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture)"
+        }
+    }
+}
+
 Push-Location $root
 try {
     cargo build --release --locked -p zeron
@@ -32,7 +45,8 @@ try {
         $version = $versionMatch.Groups[1].Value
     } finally { $process.Dispose() }
     $out = Join-Path $root 'target/package'
-    $stage = Join-Path $out "zeron-$version-windows-x86_64"
+    $arch = Get-WindowsPackageArch
+    $stage = Join-Path $out "zeron-$version-windows-$arch"
     New-Item -ItemType Directory -Force -Path $stage | Out-Null
     Copy-Item -LiteralPath './target/release/zeron.exe' -Destination (Join-Path $stage 'zeron.exe')
     @{ releases_url = $ReleasesUrl } | ConvertTo-Json | Set-Content -Encoding utf8NoBOM -LiteralPath (Join-Path $stage 'zeron-update.json')
