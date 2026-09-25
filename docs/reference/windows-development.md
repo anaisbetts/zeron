@@ -3,8 +3,9 @@
 Windows supports native x64 and ARM64 source builds and portable release ZIPs.
 Release packages offer in-app updates through GitHub; keep `zeron-update.json`
 beside `zeron.exe`. Artifact names use Rust's architecture token (`x86_64` or
-`aarch64`) so the updater can find the matching executable. Installers and
-background services are not supported yet.
+`aarch64`) so the updater can find the matching executable; published
+releases currently include x64 only. Installers and background services are
+not supported yet.
 
 ## Build and run
 
