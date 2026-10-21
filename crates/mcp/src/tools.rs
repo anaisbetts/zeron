@@ -1818,10 +1818,12 @@ mod tests {
         assert!(err.contains("discarded the machine"), "{err}");
         let writes = world.writes.lock().unwrap();
         assert_eq!(writes[0].0, methods::CLOUD_PROVISION);
-        assert_eq!(writes[1].0, methods::CLOUD_MACHINE);
-        assert_eq!(writes[1].1["action"], "discard");
-        assert_eq!(writes[1].1["deviceId"], "dev-cloud-new");
-        assert_eq!(writes.len(), 2);
+        assert_eq!(writes[1].0, methods::MUTATE);
+        assert_eq!(writes[1].1["op"], "createChat");
+        assert_eq!(writes[2].0, methods::CLOUD_MACHINE);
+        assert_eq!(writes[2].1["action"], "discard");
+        assert_eq!(writes[2].1["deviceId"], "dev-cloud-new");
+        assert_eq!(writes.len(), 3);
     }
 
     #[tokio::test]
