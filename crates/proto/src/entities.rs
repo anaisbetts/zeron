@@ -94,11 +94,74 @@ pub struct Device {
     /// this device row. Missing on older builds.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub capabilities: Vec<String>,
+    /// Set on cloud devices: the edge-managed VM behind one cloud chat.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cloud: Option<CloudMachine>,
 }
 
 impl Device {
     pub fn supports(&self, capability: &str) -> bool {
         self.capabilities.iter().any(|value| value == capability)
+    }
+
+    pub fn is_cloud(&self) -> bool {
+        self.cloud.is_some()
+    }
+}
+
+/// The edge-managed VM behind a cloud device, from the device row's `cloud`
+/// object or flat `cloud*` fields (written by the edge's CloudRoom).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CloudMachine {
+    /// `"boat"` today.
+    pub provider: String,
+    pub state: CloudState,
+    /// The one chat this machine exists for.
+    pub chat_id: Option<String>,
+    /// Bumped each time the VM is recreated from the template.
+    pub generation: u32,
+    pub error: Option<String>,
+}
+
+/// Mirrors `CloudState` on the edge's cloud machine lifecycle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum CloudState {
+    Provisioning,
+    Running,
+    Stopping,
+    Stopped,
+    Resuming,
+    Recreating,
+    Error,
+}
+
+impl CloudState {
+    /// Parse the wire spelling. A state from a newer edge reads as stopped:
+    /// the machine still resumes on the next send.
+    pub fn from_wire(value: &str) -> CloudState {
+        match value {
+            "provisioning" => CloudState::Provisioning,
+            "running" => CloudState::Running,
+            "stopping" => CloudState::Stopping,
+            "resuming" => CloudState::Resuming,
+            "recreating" => CloudState::Recreating,
+            "error" => CloudState::Error,
+            _ => CloudState::Stopped,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CloudState::Provisioning => "provisioning",
+            CloudState::Running => "running",
+            CloudState::Stopping => "stopping",
+            CloudState::Stopped => "stopped",
+            CloudState::Resuming => "resuming",
+            CloudState::Recreating => "recreating",
+            CloudState::Error => "error",
+        }
     }
 }
 

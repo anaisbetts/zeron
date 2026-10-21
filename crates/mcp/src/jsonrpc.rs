@@ -31,7 +31,14 @@ Chats are referenced by full id, a unique id prefix, or an exact title. Use \
 attributed to it and a chat cannot message itself. For request/response \
 with another chat, call `send_message` with `wait: true` (or `wait_for_turn` \
 later) — it returns the assistant's reply once that chat's turn finishes. \
-If a chat is `awaitingInput`, answer it with `respond_to_input`.";
+If a chat is `awaitingInput`, answer it with `respond_to_input`.\n\
+\n\
+Use `kind: cloud` in `create_chat` to start a standalone session on a new \
+cloud machine (an edge-managed Boat VM). It takes no project, device, parent, \
+or cwd. Harness defaults to claude-code without querying the machine. Sending \
+a message to a cloud chat wakes a sleeping machine; listing files, harnesses, \
+or models on an asleep machine fails until it is up. Use `cloud_machine` to \
+wake, stop, or discard.";
 
 const PARSE_ERROR: i64 = -32700;
 const INVALID_REQUEST: i64 = -32600;

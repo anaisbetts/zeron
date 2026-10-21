@@ -12,7 +12,10 @@
 
 use chrono::{DateTime, Utc};
 
-use crate::{AuthState, Chat, ChatIndicator, Session, SessionStatus, Space, WorkspaceScope};
+use crate::{
+    AuthState, Chat, ChatIndicator, CloudMachine, CloudState, Device, Session, SessionStatus,
+    Space, WorkspaceScope,
+};
 
 // ---------------------------------------------------------------------------
 // Connection + status
@@ -61,6 +64,46 @@ pub fn effective_indicator(session: Option<&Session>, now: DateTime<Utc>) -> Ind
             }
         }
     }
+}
+
+/// A cloud device hosts exactly one cloud chat, so it never appears in host
+/// or device pickers.
+pub fn is_cloud_device(device: &Device) -> bool {
+    device.is_cloud()
+}
+
+/// One-line status for a cloud chat's machine (header, composer, settings).
+/// `online` is the host's live presence, which lags the edge's state by a
+/// few seconds after a boot.
+pub fn cloud_status_label(cloud: &CloudMachine, online: bool) -> &'static str {
+    match cloud.state {
+        CloudState::Provisioning => "Starting cloud machine…",
+        CloudState::Running if online => "Cloud machine running",
+        CloudState::Running => "Connecting to cloud machine…",
+        CloudState::Stopping => "Cloud machine going to sleep…",
+        CloudState::Stopped => "Cloud machine asleep · wakes on send",
+        CloudState::Resuming => "Waking cloud machine…",
+        CloudState::Recreating => "Recreating cloud machine…",
+        CloudState::Error => "Cloud machine failed · send to retry",
+    }
+}
+
+/// Compact form of [`cloud_status_label`] for sidebar rows.
+pub fn cloud_short_label(cloud: &CloudMachine) -> &'static str {
+    match cloud.state {
+        CloudState::Provisioning => "Cloud · starting",
+        CloudState::Running => "Cloud",
+        CloudState::Stopping | CloudState::Stopped => "Cloud · asleep",
+        CloudState::Resuming => "Cloud · waking",
+        CloudState::Recreating => "Cloud · recreating",
+        CloudState::Error => "Cloud · failed",
+    }
+}
+
+/// The machine was rebuilt from the template at least once: files from
+/// earlier turns are gone even though the transcript remains.
+pub fn cloud_was_recreated(cloud: &CloudMachine) -> bool {
+    cloud.generation > 1
 }
 
 /// The full display status for a chat row / tab dot: live states win, then the
@@ -242,6 +285,44 @@ mod gate_tests {
             gate_phase(&ConnectionStatus::Ready, None, None),
             GatePhase::SignIn
         );
+    }
+}
+
+#[cfg(test)]
+mod cloud_label_tests {
+    use super::*;
+
+    fn machine(state: CloudState, generation: u32) -> CloudMachine {
+        CloudMachine {
+            provider: "boat".into(),
+            state,
+            chat_id: Some("chat-1".into()),
+            generation,
+            error: None,
+        }
+    }
+
+    #[test]
+    fn running_waits_for_presence_before_saying_the_machine_is_up() {
+        let running = machine(CloudState::Running, 1);
+        assert_eq!(
+            cloud_status_label(&running, false),
+            "Connecting to cloud machine…"
+        );
+        assert_eq!(cloud_status_label(&running, true), "Cloud machine running");
+        assert_eq!(cloud_short_label(&running), "Cloud");
+        assert!(!cloud_was_recreated(&running));
+    }
+
+    #[test]
+    fn asleep_and_recreated_labels() {
+        let stopped = machine(CloudState::Stopped, 2);
+        assert_eq!(
+            cloud_status_label(&stopped, false),
+            "Cloud machine asleep · wakes on send"
+        );
+        assert_eq!(cloud_short_label(&stopped), "Cloud · asleep");
+        assert!(cloud_was_recreated(&stopped));
     }
 }
 

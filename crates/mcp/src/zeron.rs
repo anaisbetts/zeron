@@ -17,7 +17,8 @@ use zeron_doc::{
     SessionCommandPayload, SessionMessageEntry, TranscriptFrame, apply_transcript_frame,
 };
 use zeron_proto::{
-    Chat, Device, HarnessId, Model, ReasoningLevel, Session, SessionStatus, Space, SteeringMode,
+    Chat, CloudState, Device, HarnessId, Model, ReasoningLevel, Session, SessionStatus, Space,
+    SteeringMode,
 };
 use zeron_rpc::{RpcClient, RpcError, connect_ws, methods};
 
@@ -27,6 +28,9 @@ const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(15);
 /// Gap between resubscribes when a watch stream ends at a lifecycle
 /// boundary (chat2 cutover etc.) — the same contract the UI follows.
 const RESUBSCRIBE_DELAY: Duration = Duration::from_millis(300);
+/// A device that pinged within this window is online (engines heartbeat
+/// every 15s; the UI's Devices page uses the same window).
+const DEVICE_ONLINE_WINDOW: chrono::Duration = chrono::Duration::seconds(70);
 
 /// Which chat this server speaks for, when the engine injected it into a
 /// harness. Unset when a human runs `zeron mcp` from a terminal.
@@ -101,6 +105,17 @@ pub enum TurnOutcome {
     /// The run failed.
     Errored,
     /// The deadline passed with the chat still working (or never starting).
+    TimedOut,
+}
+
+/// Why a `wait_for_machine` returned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum MachineOutcome {
+    /// The machine is running and its engine is online.
+    Running,
+    /// The edge gave up on the machine (`error` state).
+    Failed,
     TimedOut,
 }
 
@@ -386,6 +401,40 @@ impl Zeron {
         }
     }
 
+    /// A cloud machine by its device (id or exact name) or by the chat it
+    /// hosts (id, unique prefix, or exact title).
+    pub async fn resolve_cloud_machine(&self, key: &str) -> anyhow::Result<Device> {
+        let key = key.trim();
+        if key.is_empty() {
+            bail!("cloud machine is required");
+        }
+        let devices = self.devices().await?;
+        if let Some(device) = devices
+            .iter()
+            .find(|d| d.id == key || d.name.eq_ignore_ascii_case(key))
+        {
+            return cloud_device(&devices, &device.id);
+        }
+        let chat = self.resolve_chat(key).await.map_err(|_| {
+            anyhow!(
+                "no device matches {key:?} as a cloud machine (device id or name, or its chat's id, prefix, or title)"
+            )
+        })?;
+        cloud_device(&devices, &chat.device_id)
+    }
+
+    /// The cloud machine hosting `chat`.
+    pub async fn cloud_machine_for_chat(&self, chat: &str) -> anyhow::Result<Device> {
+        let chat = self.resolve_chat(chat).await?;
+        cloud_device(&self.devices().await?, &chat.device_id)
+    }
+
+    /// The cloud machine `device` names (id or exact name).
+    pub async fn cloud_machine_by_device(&self, device: &str) -> anyhow::Result<Device> {
+        let id = self.resolve_device_id(Some(device)).await?;
+        cloud_device(&self.devices().await?, &id)
+    }
+
     // ---- turn waiting ------------------------------------------------------
 
     /// Block until `chat`'s turn settles.
@@ -474,6 +523,86 @@ impl Zeron {
                 }
             }
         }
+    }
+
+    /// Block until the cloud machine `device_id` is running with its engine
+    /// online, or the edge marks it failed. An `error` row only counts once
+    /// a newer state has synced: right after a wake the local registry may
+    /// still hold the failure the wake is recovering from.
+    pub async fn wait_for_machine(
+        &self,
+        device_id: &str,
+        timeout: Duration,
+    ) -> anyhow::Result<(MachineOutcome, Option<Device>)> {
+        let deadline = Instant::now() + timeout;
+        let mut recovering = false;
+        let mut last: Option<Device> = None;
+        'resubscribe: loop {
+            if deadline.saturating_duration_since(Instant::now()).is_zero() {
+                return Ok((MachineOutcome::TimedOut, last));
+            }
+            let mut rx = self.subscribe(methods::WATCH_DEVICES, json!({})).await?;
+            loop {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                let item = match tokio::time::timeout(remaining, rx.recv()).await {
+                    Ok(Some(item)) => item,
+                    Ok(None) => {
+                        tokio::time::sleep(RESUBSCRIBE_DELAY).await;
+                        continue 'resubscribe;
+                    }
+                    Err(_) => return Ok((MachineOutcome::TimedOut, last)),
+                };
+                let devices: Vec<Device> = match serde_json::from_value(item) {
+                    Ok(devices) => devices,
+                    Err(err) => {
+                        tracing::warn!(error = %err, "WatchDevices: unexpected item");
+                        continue;
+                    }
+                };
+                let Some(device) = devices.into_iter().find(|d| d.id == device_id) else {
+                    continue;
+                };
+                let Some(state) = device.cloud.as_ref().map(|c| c.state) else {
+                    bail!("device {device_id} is not a cloud machine");
+                };
+                let online = device_online(&device);
+                last = Some(device);
+                match state {
+                    CloudState::Running if online => return Ok((MachineOutcome::Running, last)),
+                    CloudState::Error if recovering => return Ok((MachineOutcome::Failed, last)),
+                    CloudState::Error => {}
+                    CloudState::Provisioning
+                    | CloudState::Running
+                    | CloudState::Stopping
+                    | CloudState::Stopped
+                    | CloudState::Resuming
+                    | CloudState::Recreating => recovering = true,
+                }
+            }
+        }
+    }
+}
+
+/// Seen inside the heartbeat window.
+pub fn device_online(device: &Device) -> bool {
+    device
+        .last_seen_at
+        .is_some_and(|at| chrono::Utc::now() - at <= DEVICE_ONLINE_WINDOW)
+}
+
+/// The host `device_id` when it is a cloud machine.
+pub fn cloud_host<'a>(devices: &'a [Device], device_id: &str) -> Option<&'a Device> {
+    devices
+        .iter()
+        .find(|d| d.id == device_id)
+        .filter(|d| d.is_cloud())
+}
+
+fn cloud_device(devices: &[Device], device_id: &str) -> anyhow::Result<Device> {
+    match devices.iter().find(|d| d.id == device_id) {
+        Some(device) if device.is_cloud() => Ok(device.clone()),
+        Some(device) => bail!("{} ({}) is not a cloud machine", device.name, device.id),
+        None => bail!("no device matches {device_id:?}"),
     }
 }
 

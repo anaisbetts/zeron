@@ -64,13 +64,24 @@ name (default: the local engine's device).
 | `list_models`      | `ListModels {harness}`                                    |
 | `list_chats`       | `WatchChats` + `WatchSessions` snapshots (status merged)  |
 | `get_chat`         | above + `WatchDocMessages` opening frame (pending input)  |
-| `create_chat`      | `Mutate createChat` (+ `renameChat`; optional first send) |
+| `create_chat`      | `Mutate createChat` (+ `renameChat`; optional first send). `kind: cloud` is `CloudProvision` then `createChat` on the new device with a scratch cwd; create failure discards the VM. |
 | `read_chat`        | `WatchDocMessages` opening `reset` frame, rendered        |
-| `send_message`     | `QueueCommand` Run / Steer, or `QueueMessage`             |
+| `send_message`     | `QueueCommand` Run / Steer, or `QueueMessage`. A cloud host skips `ListHarnesses` (the VM may be asleep); harness comes from the chat config or `claude-code`. |
 | `wait_for_turn`    | `WatchSessions` until the chat settles                    |
 | `interrupt_chat`   | `QueueCommand` Interrupt                                  |
 | `respond_to_input` | `QueueCommand` RespondInput                               |
 | `archive_chat`     | `Mutate setChatArchived`                                  |
+| `cloud_machine`    | `CloudMachine { action: wake\|stop\|discard }`. Target is a device or its bound chat. |
+
+`list_devices` and chat summaries include `cloud` when the host is a cloud
+machine (`provider`, `state`, `chatId`, `generation`, `error`, plus
+`statusLabel` / `shortLabel` / `recreated`). `kind: cloud` takes no project,
+device, parent, or cwd. A send wakes a sleeping machine; harness/model
+catalogs on an asleep VM fail until it is up.
+
+The `zeron-remote` CLI (`apps/zts`) wraps these tools (`sessions`, `devices`,
+`cloud ls|wake|stop|discard`). `--kind cloud` provisions a Boat VM, creates
+the chat with the same id in a scratch folder, and skips the host catalog.
 
 Watch streams are the engine's only read surface (there is no one-shot "get
 transcript" RPC); a snapshot is "subscribe, take the first item, drop" — drop

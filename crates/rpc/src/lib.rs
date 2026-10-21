@@ -108,6 +108,10 @@ pub mod methods {
     /// Params are tagged `{op: createChat|createSpace|renameSpace|deleteSpace|
     /// renameChat|setChatArchived|deleteChat|renameDevice|markChatSeen, …}`.
     pub const MUTATE: &str = "Mutate";
+    /// Provision a cloud machine for a new chat → `{deviceId, chatId, state, generation}`.
+    pub const CLOUD_PROVISION: &str = "CloudProvision";
+    /// Wake, stop, or discard a cloud machine → `{deviceId, chatId, state, generation}`.
+    pub const CLOUD_MACHINE: &str = "CloudMachine";
     /// This engine's identity → `{deviceId}` (IPC-only; never relay-forwarded —
     /// the answer is about whichever engine you are directly connected to).
     pub const LOCAL_DEVICE: &str = "LocalDevice";
