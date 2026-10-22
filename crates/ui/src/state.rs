@@ -3559,6 +3559,7 @@ mod tests {
             version: None,
             cursor_sdk_version: None,
             capabilities: Vec::new(),
+            cloud: None,
         }
     }
 
@@ -4527,6 +4528,7 @@ mod tests {
             version: Some("0.2.12".into()),
             cursor_sdk_version: None,
             capabilities: Vec::new(),
+            cloud: None,
         }];
         assert!(s.device_version_at_least("d1", (0, 2, 12)));
         assert!(!s.device_version_at_least("d1", (0, 2, 13)));
@@ -4550,6 +4552,7 @@ mod tests {
                 version: Some("0.2.31".into()),
                 cursor_sdk_version: None,
                 capabilities: vec![zeron_proto::capabilities::MESSAGE_QUEUE_V1.into()],
+                cloud: None,
             },
             Device {
                 id: "upstream".into(),
@@ -4560,6 +4563,7 @@ mod tests {
                 version: Some("0.2.31".into()),
                 cursor_sdk_version: None,
                 capabilities: Vec::new(),
+                cloud: None,
             },
         ];
 
@@ -4587,6 +4591,7 @@ mod tests {
             version: None,
             cursor_sdk_version: None,
             capabilities: Vec::new(),
+            cloud: None,
         }];
         s.connectivity.state = ConnectivityState::Connected;
         s.connectivity.chats = vec![ChatConnectivity {

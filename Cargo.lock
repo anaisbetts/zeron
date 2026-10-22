@@ -11924,6 +11924,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "zeron-remote"
+version = "0.2.86"
+dependencies = [
+ "anyhow",
+ "clap",
+ "serde_json",
+ "tokio",
+ "zeron-mcp",
+]
+
+[[package]]
 name = "zeron-rpc"
 version = "0.2.86"
 dependencies = [

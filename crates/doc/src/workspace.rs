@@ -118,6 +118,19 @@ impl WorkspaceDoc {
             "capabilities",
             crate::schema::loro_value_from_json(&serde_json::json!(&device.capabilities)),
         )?;
+        if let Some(cloud) = &device.cloud {
+            row.insert(
+                "cloud",
+                crate::schema::loro_value_from_json(
+                    &serde_json::to_value(cloud).unwrap_or_default(),
+                ),
+            )?;
+            set_opt_str(&row, "cloudProvider", Some(cloud.provider.as_str()))?;
+            set_opt_str(&row, "cloudState", Some(cloud.state.as_str()))?;
+            set_opt_str(&row, "cloudChatId", cloud.chat_id.as_deref())?;
+            row.insert("cloudGeneration", i64::from(cloud.generation))?;
+            set_opt_str(&row, "cloudError", cloud.error.as_deref())?;
+        }
         self.doc.commit();
         Ok(())
     }
@@ -619,6 +632,18 @@ pub(crate) struct RawDevice {
     cursor_sdk_engine_version: Option<String>,
     #[serde(default)]
     capabilities: Vec<String>,
+    #[serde(default)]
+    cloud: Option<zeron_proto::CloudMachine>,
+    #[serde(default)]
+    cloud_provider: Option<String>,
+    #[serde(default)]
+    cloud_state: Option<String>,
+    #[serde(default)]
+    cloud_chat_id: Option<String>,
+    #[serde(default)]
+    cloud_generation: Option<u32>,
+    #[serde(default)]
+    cloud_error: Option<String>,
 }
 
 impl From<RawDevice> for Device {
@@ -626,6 +651,16 @@ impl From<RawDevice> for Device {
         let sdk_version = raw
             .cursor_sdk_version
             .filter(|_| raw.version.is_some() && raw.version == raw.cursor_sdk_engine_version);
+        let cloud = raw.cloud.or_else(|| {
+            let state = raw.cloud_state.as_deref()?;
+            Some(zeron_proto::CloudMachine {
+                provider: raw.cloud_provider.unwrap_or_else(|| "boat".to_string()),
+                state: zeron_proto::CloudState::from_wire(state),
+                chat_id: raw.cloud_chat_id,
+                generation: raw.cloud_generation.unwrap_or(1),
+                error: raw.cloud_error,
+            })
+        });
         Device {
             id: raw.id,
             name: raw.name,
@@ -635,6 +670,7 @@ impl From<RawDevice> for Device {
             version: raw.version,
             cursor_sdk_version: sdk_version,
             capabilities: raw.capabilities,
+            cloud,
         }
     }
 }
@@ -806,7 +842,33 @@ mod tests {
             version: Some("0.1.0".into()),
             cursor_sdk_version: None,
             capabilities: Vec::new(),
+            cloud: None,
         }
+    }
+
+    #[test]
+    fn cloud_machine_survives_workspace_round_trip() {
+        let local = WorkspaceDoc::new();
+        let mut row = device("boat-1", "Boat");
+        row.cloud = Some(zeron_proto::CloudMachine {
+            provider: "boat".into(),
+            state: zeron_proto::CloudState::Stopped,
+            chat_id: Some("chat-1".into()),
+            generation: 2,
+            error: None,
+        });
+        local.upsert_device(&row).unwrap();
+        let remote = WorkspaceDoc::new();
+        remote
+            .doc()
+            .import(&local.export_snapshot().unwrap())
+            .unwrap();
+        let got = &remote.read_devices().unwrap()[0];
+        let cloud = got.cloud.as_ref().expect("cloud metadata");
+        assert_eq!(cloud.provider, "boat");
+        assert_eq!(cloud.state, zeron_proto::CloudState::Stopped);
+        assert_eq!(cloud.chat_id.as_deref(), Some("chat-1"));
+        assert_eq!(cloud.generation, 2);
     }
 
     #[test]

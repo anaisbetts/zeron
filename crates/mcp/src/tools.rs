@@ -13,16 +13,22 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use zeron_doc::SessionCommandPayload;
 use zeron_proto::{
-    Chat, ChatConfig, HarnessId, ReasoningLevel, RunRequest, SandboxLevel, Session, SessionStatus,
-    Space, UserInputAnswer,
+    Chat, ChatConfig, Device, HarnessId, ReasoningLevel, RunRequest, SandboxLevel, Session,
+    SessionStatus, Space, UserInputAnswer,
 };
 
 use crate::transcript::{RenderOptions, RenderedMessage, render_entries};
-use crate::zeron::{HarnessInfo, TurnOutcome, Zeron, session_for, short};
+use crate::zeron::{
+    HarnessInfo, MachineOutcome, TurnOutcome, Zeron, cloud_host, device_online, session_for, short,
+};
+use zeron_rpc::methods;
 
 /// Default and ceiling for the blocking waits.
 const DEFAULT_WAIT: Duration = Duration::from_secs(600);
 const MAX_WAIT: Duration = Duration::from_secs(3600);
+/// What a cloud chat runs when the caller names no harness. A machine that
+/// is asleep or not created yet has no catalog to pick from.
+const CLOUD_DEFAULT_HARNESS: HarnessId = HarnessId::ClaudeCode;
 /// A session row older than this is not trusted to still be working
 /// (the UI's staleness window): a crashed host must not read as busy forever.
 const SESSION_STALE: chrono::Duration = chrono::Duration::seconds(45);
@@ -63,7 +69,7 @@ fn catalog() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "list_devices",
-            description: "Devices in this workspace (the local engine's device is flagged). Chats and projects are hosted on a device.",
+            description: "Devices in this workspace (the local engine's device is flagged). Chats and projects are hosted on a device. A cloud machine (an edge-managed VM serving one cloud chat) carries `cloud` with its state: provisioning, running, stopping, stopped, resuming, recreating, or error.",
             input_schema: json!({ "type": "object", "properties": {} }),
         },
         ToolDef {
@@ -108,10 +114,11 @@ fn catalog() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "create_chat",
-            description: "Create a chat in a project (or project-less on a device) with a harness and model. The new chat records your chat as its parent (parentChatId). Optionally send a first prompt and wait for the reply. Returns the new chat id.",
+            description: "Create a chat in a project (or project-less on a device) with a harness and model, or a standalone session on a new cloud machine with kind cloud. The new chat records your chat as its parent (parentChatId) unless kind is cloud. A cloud chat takes no project, device, parent, or cwd: the edge starts a fresh VM for it, the chat runs in a scratch folder there, and harness/model are not validated (harness defaults to claude-code). Optionally send a first prompt and wait for the reply. Returns the new chat id.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
+                    "kind": { "type": "string", "enum": ["chat", "cloud"], "description": "chat: ordinary create. cloud: standalone on a new cloud machine. Omit for an ordinary chat." },
                     "project": { "type": "string", "description": "Project id, path, or name. Required unless device is given." },
                     "device": { "type": "string", "description": "Host device (id or name) for a project-less chat; defaults to this device." },
                     "parent": { "type": "string", "description": "Parent chat to record (id, prefix, or title). Defaults to the chat you are speaking from." },
@@ -179,6 +186,21 @@ fn catalog() -> Vec<ToolDef> {
             })),
         },
         ToolDef {
+            name: "cloud_machine",
+            description: "Wake, stop, or discard the cloud machine behind a cloud chat. Name it by device (id or name) or by its chat. A send to a cloud chat wakes its machine on its own; wake it explicitly before reading its files or catalogs. Stop puts it to sleep (files survive). Discard deletes the machine and its files; the chat stays, and its next message starts a fresh machine. With wait=true, wake blocks until the machine is running.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "action": { "type": "string", "enum": ["wake", "stop", "discard"] },
+                    "device": { "type": "string", "description": "Cloud machine device id or name." },
+                    "chat": { "type": "string", "description": "The cloud chat (id, prefix, or title) whose machine to act on." },
+                    "wait": { "type": "boolean", "default": false, "description": "With wake: block until the machine is running or failed." },
+                    "timeout_secs": { "type": "integer", "minimum": 1, "maximum": 3600, "default": 600 }
+                },
+                "required": ["action"]
+            }),
+        },
+        ToolDef {
             name: "archive_chat",
             description: "Archive a chat (hide it from the active sidebar list); pass archived=false to restore. Use it to tidy up chats you created.",
             input_schema: chat_key_schema(json!({
@@ -210,8 +232,36 @@ struct ListChatsArgs {
     limit: Option<usize>,
 }
 
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+enum ChatKind {
+    Chat,
+    /// Standalone, on a cloud machine the edge starts for this chat.
+    Cloud,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+enum CloudAction {
+    Wake,
+    Stop,
+    /// Delete the VM and its disk; the chat's next message starts a fresh one.
+    Discard,
+}
+
+#[derive(Deserialize)]
+struct CloudMachineArgs {
+    action: CloudAction,
+    device: Option<String>,
+    chat: Option<String>,
+    #[serde(default)]
+    wait: bool,
+    timeout_secs: Option<u64>,
+}
+
 #[derive(Deserialize, Default)]
 struct CreateChatArgs {
+    kind: Option<ChatKind>,
     project: Option<String>,
     device: Option<String>,
     parent: Option<String>,
@@ -285,6 +335,10 @@ fn wait_duration(secs: Option<u64>) -> Duration {
         .min(MAX_WAIT)
 }
 
+fn nonempty(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|v| !v.is_empty())
+}
+
 fn now_millis() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -316,14 +370,19 @@ fn status_of(session: Option<&Session>) -> (String, Option<i64>) {
     (label.into(), Some(age.num_seconds().max(0)))
 }
 
-fn summarize_chat(chat: &Chat, spaces: &[Space], sessions: &[Session]) -> Value {
+fn summarize_chat(
+    chat: &Chat,
+    spaces: &[Space],
+    sessions: &[Session],
+    devices: &[Device],
+) -> Value {
     let space = chat
         .space_id
         .as_deref()
         .and_then(|id| spaces.iter().find(|s| s.id == id));
     let session = session_for(sessions, chat);
     let (status, status_age) = status_of(session.as_ref());
-    json!({
+    let mut summary = json!({
         "id": chat.id,
         "title": chat.title,
         "project": space.map(|s| json!({
@@ -344,6 +403,28 @@ fn summarize_chat(chat: &Chat, spaces: &[Space], sessions: &[Session]) -> Value 
         "lastMessageAt": chat.last_message_at,
         "lastMessagePreview": chat.last_message_preview,
         "createdAt": chat.created_at,
+    });
+    if let Some(host) = cloud_host(devices, &chat.device_id) {
+        summary["cloud"] = summarize_cloud(host);
+    }
+    summary
+}
+
+/// A cloud machine's lifecycle as the edge last wrote it, with the labels
+/// the apps show for it. Null for an ordinary device.
+fn summarize_cloud(device: &Device) -> Value {
+    let Some(cloud) = &device.cloud else {
+        return Value::Null;
+    };
+    json!({
+        "provider": cloud.provider,
+        "state": cloud.state,
+        "chatId": cloud.chat_id,
+        "generation": cloud.generation,
+        "error": cloud.error,
+        "statusLabel": zeron_proto::view::cloud_status_label(cloud, device_online(device)),
+        "shortLabel": zeron_proto::view::cloud_short_label(cloud),
+        "recreated": zeron_proto::view::cloud_was_recreated(cloud),
     })
 }
 
@@ -384,6 +465,7 @@ impl Tools {
             "interrupt_chat" => self.interrupt_chat(parse(args)?).await,
             "respond_to_input" => self.respond_to_input(parse(args)?).await,
             "archive_chat" => self.archive_chat(parse(args)?).await,
+            "cloud_machine" => self.cloud_machine(parse(args)?).await,
             other => return Err(format!("unknown tool: {other}")),
         };
         result.map_err(|e| e.to_string())
@@ -396,9 +478,12 @@ impl Tools {
         let chat = match origin.chat_id.as_deref() {
             Some(id) => match self.zeron.resolve_chat(id).await {
                 Ok(chat) => {
-                    let (spaces, sessions) =
-                        tokio::try_join!(self.zeron.spaces(), self.zeron.sessions())?;
-                    summarize_chat(&chat, &spaces, &sessions)
+                    let (spaces, sessions, devices) = tokio::try_join!(
+                        self.zeron.spaces(),
+                        self.zeron.sessions(),
+                        self.zeron.devices()
+                    )?;
+                    summarize_chat(&chat, &spaces, &sessions, &devices)
                 }
                 Err(_) => json!({ "id": id }),
             },
@@ -421,14 +506,21 @@ impl Tools {
         let (devices, local) =
             tokio::try_join!(self.zeron.devices(), self.zeron.local_device_id())?;
         Ok(json!({
-            "devices": devices.iter().map(|d| json!({
-                "id": d.id,
-                "name": d.name,
-                "platform": d.platform,
-                "local": d.id == local,
-                "lastSeenAt": d.last_seen_at,
-                "version": d.version,
-            })).collect::<Vec<_>>()
+            "devices": devices.iter().map(|d| {
+                let mut row = json!({
+                    "id": d.id,
+                    "name": d.name,
+                    "platform": d.platform,
+                    "local": d.id == local,
+                    "online": device_online(d),
+                    "lastSeenAt": d.last_seen_at,
+                    "version": d.version,
+                });
+                if d.is_cloud() {
+                    row["cloud"] = summarize_cloud(d);
+                }
+                row
+            }).collect::<Vec<_>>()
         }))
     }
 
@@ -477,10 +569,11 @@ impl Tools {
     }
 
     async fn list_chats(&self, args: ListChatsArgs) -> anyhow::Result<Value> {
-        let (mut chats, spaces, sessions) = tokio::try_join!(
+        let (mut chats, spaces, sessions, devices) = tokio::try_join!(
             self.zeron.chats(),
             self.zeron.spaces(),
-            self.zeron.sessions()
+            self.zeron.sessions(),
+            self.zeron.devices()
         )?;
         if let Some(project) = args.project.as_deref() {
             let space = self.zeron.resolve_space(project).await?;
@@ -507,20 +600,21 @@ impl Tools {
         Ok(json!({
             "total": total,
             "chats": chats.iter().take(limit)
-                .map(|c| summarize_chat(c, &spaces, &sessions))
+                .map(|c| summarize_chat(c, &spaces, &sessions, &devices))
                 .collect::<Vec<_>>()
         }))
     }
 
     async fn get_chat(&self, args: ChatArgs) -> anyhow::Result<Value> {
         let chat = self.zeron.resolve_chat(&args.chat).await?;
-        let (spaces, sessions, entries) = tokio::try_join!(
+        let (spaces, sessions, devices, entries) = tokio::try_join!(
             self.zeron.spaces(),
             self.zeron.sessions(),
+            self.zeron.devices(),
             self.zeron.transcript(&chat.id)
         )?;
         let rendered = render_entries(&entries, RenderOptions::default());
-        let mut summary = summarize_chat(&chat, &spaces, &sessions);
+        let mut summary = summarize_chat(&chat, &spaces, &sessions, &devices);
         summary["messageCount"] = json!(rendered.len());
         summary["pendingInput"] = last_pending_input(&rendered).unwrap_or(Value::Null);
         summary["lastMessage"] = rendered.last().map(|m| json!(m)).unwrap_or(Value::Null);
@@ -528,6 +622,9 @@ impl Tools {
     }
 
     async fn create_chat(&self, args: CreateChatArgs) -> anyhow::Result<Value> {
+        if args.kind == Some(ChatKind::Cloud) {
+            return self.create_cloud_chat(args).await;
+        }
         let harnesses = self.zeron.harnesses().await?;
         let harness = match args.harness.as_deref() {
             Some(raw) => {
@@ -724,11 +821,14 @@ impl Tools {
                 short(&chat.id)
             );
         }
-        let (spaces, sessions, harnesses) = tokio::try_join!(
-            self.zeron.spaces(),
-            self.zeron.sessions(),
-            self.zeron.harnesses()
-        )?;
+        let devices = self.zeron.devices().await?;
+        let on_cloud = cloud_host(&devices, &chat.device_id).is_some();
+        let (spaces, sessions) = tokio::try_join!(self.zeron.spaces(), self.zeron.sessions())?;
+        let harnesses = if on_cloud {
+            Vec::new()
+        } else {
+            self.zeron.harnesses().await?
+        };
         let space = chat
             .space_id
             .as_deref()
@@ -826,6 +926,201 @@ impl Tools {
         Ok(json!({ "chatId": chat.id, "requestId": request_id, "commandId": command_id }))
     }
 
+    async fn create_cloud_chat(&self, args: CreateChatArgs) -> anyhow::Result<Value> {
+        anyhow::ensure!(
+            nonempty(args.project.as_deref()).is_none(),
+            "kind cloud cannot have a project"
+        );
+        anyhow::ensure!(
+            nonempty(args.device.as_deref()).is_none(),
+            "kind cloud cannot have a device"
+        );
+        anyhow::ensure!(
+            nonempty(args.parent.as_deref()).is_none(),
+            "kind cloud cannot have a parent"
+        );
+        anyhow::ensure!(
+            nonempty(args.cwd.as_deref()).is_none(),
+            "kind cloud cannot have a cwd"
+        );
+
+        let harness = match args.harness.as_deref() {
+            Some(raw) => parse_enum("harness", raw).map_err(anyhow::Error::msg)?,
+            None => CLOUD_DEFAULT_HARNESS,
+        };
+        let reasoning: Option<ReasoningLevel> = match args.reasoning.as_deref() {
+            Some(raw) => Some(parse_enum("reasoning level", raw).map_err(anyhow::Error::msg)?),
+            None => None,
+        };
+        let sandbox: SandboxLevel = match args.sandbox.as_deref() {
+            Some(raw) => parse_enum("sandbox", raw).map_err(anyhow::Error::msg)?,
+            None => SandboxLevel::WorkspaceWrite,
+        };
+        let config = ChatConfig {
+            harness,
+            model: args.model.clone(),
+            reasoning,
+            model_options: Default::default(),
+            sandbox,
+        };
+
+        let chat_id = uuid::Uuid::new_v4().to_string();
+        let provision = self
+            .zeron
+            .call(methods::CLOUD_PROVISION, json!({ "chatId": chat_id }))
+            .await?;
+        let device_id = provision
+            .get("deviceId")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("CloudProvision reply missing deviceId"))?
+            .to_owned();
+        let cwd = zeron_proto::projectless::scratch_cwd(&chat_id, chrono::Utc::now());
+        let created = self
+            .zeron
+            .mutate(json!({
+                "op": "createChat",
+                "chatId": chat_id,
+                "deviceId": device_id,
+                "config": config,
+                "cwd": cwd,
+            }))
+            .await;
+        if let Err(err) = created {
+            if let Err(discard_err) = self
+                .zeron
+                .call(
+                    methods::CLOUD_MACHINE,
+                    json!({ "deviceId": device_id, "action": "discard" }),
+                )
+                .await
+            {
+                anyhow::bail!(
+                    "createChat failed after provisioning ({err:#}); also failed to discard the machine: {discard_err:#}"
+                );
+            }
+            anyhow::bail!("createChat failed after provisioning; discarded the machine: {err:#}");
+        }
+        if let Some(title) = nonempty(args.title.as_deref()) {
+            self.zeron
+                .mutate(json!({ "op": "renameChat", "chatId": chat_id, "title": title }))
+                .await?;
+        }
+
+        let mut result = json!({
+            "chatId": chat_id,
+            "kind": ChatKind::Cloud,
+            "deviceId": device_id,
+            "project": Value::Null,
+            "harness": harness,
+            "model": args.model,
+            "reasoning": reasoning,
+            "title": args.title,
+            "parentChatId": Value::Null,
+            "cloud": {
+                "state": provision.get("state"),
+                "generation": provision.get("generation"),
+                "error": provision.get("error"),
+            },
+        });
+        if let Some(prompt) = args.prompt.filter(|p| !p.trim().is_empty()) {
+            let chat = Chat {
+                id: chat_id.clone(),
+                device_id: device_id.clone(),
+                title: args.title.clone(),
+                archived: false,
+                cwd: Some(cwd),
+                branch: args.branch.clone(),
+                checkout_id: None,
+                source_context: None,
+                config: Some(config),
+                last_message_preview: None,
+                last_message_at: None,
+                created_at: chrono::Utc::now(),
+                harness_session_id: None,
+                harness_session_cwd: None,
+                parent_chat_id: None,
+                space_id: None,
+                last_seen_at: None,
+                room_gen: None,
+            };
+            result["sent"] = self.deliver(&chat, None, &[], None, prompt, "run").await?;
+            if args.wait {
+                result["turn"] = self
+                    .await_turn(
+                        &chat,
+                        None,
+                        true,
+                        wait_duration(args.timeout_secs),
+                        now_millis(),
+                    )
+                    .await?;
+            }
+        }
+        Ok(result)
+    }
+
+    async fn cloud_machine(&self, args: CloudMachineArgs) -> anyhow::Result<Value> {
+        let device = match (
+            args.device
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty()),
+            args.chat
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty()),
+        ) {
+            (Some(device), Some(chat)) => {
+                let by_device = self.zeron.cloud_machine_by_device(device).await?;
+                let by_chat = self.zeron.cloud_machine_for_chat(chat).await?;
+                anyhow::ensure!(
+                    by_device.id == by_chat.id,
+                    "device and chat name different cloud machines"
+                );
+                by_device
+            }
+            (Some(key), None) | (None, Some(key)) => self.zeron.resolve_cloud_machine(key).await?,
+            (None, None) => anyhow::bail!("pass a cloud device or its chat"),
+        };
+        let action = match args.action {
+            CloudAction::Wake => "wake",
+            CloudAction::Stop => "stop",
+            CloudAction::Discard => "discard",
+        };
+        let machine = self
+            .zeron
+            .call(
+                methods::CLOUD_MACHINE,
+                json!({ "deviceId": device.id, "action": action }),
+            )
+            .await?;
+        let mut result = json!({
+            "deviceId": device.id,
+            "action": args.action,
+            "machine": machine,
+            "cloud": summarize_cloud(&device),
+        });
+        if args.wait {
+            match args.action {
+                CloudAction::Wake => {
+                    let (outcome, device) = self
+                        .zeron
+                        .wait_for_machine(&device.id, wait_duration(args.timeout_secs))
+                        .await?;
+                    result["outcome"] = json!(outcome);
+                    result["timedOut"] = json!(outcome == MachineOutcome::TimedOut);
+                    if let Some(device) = device {
+                        result["cloud"] = summarize_cloud(&device);
+                        result["online"] = json!(device_online(&device));
+                    }
+                }
+                CloudAction::Stop | CloudAction::Discard => {}
+            }
+        }
+        Ok(result)
+    }
+
     // ---- shared pieces -------------------------------------------------------
 
     /// Prefix the sender's identity when this server speaks for a chat, so
@@ -864,11 +1159,11 @@ impl Tools {
         text: String,
         mode: &str,
     ) -> anyhow::Result<Value> {
-        let harness = chat
-            .config
-            .as_ref()
-            .map(|c| c.harness)
-            .map_or_else(|| default_harness(harnesses), Ok)?;
+        let harness = match chat.config.as_ref().map(|c| c.harness) {
+            Some(harness) => harness,
+            None if harnesses.is_empty() => CLOUD_DEFAULT_HARNESS,
+            None => default_harness(harnesses)?,
+        };
         let info = harnesses.iter().find(|h| h.id == harness);
         let (status, _) = status_of(session);
         let live = session
@@ -1000,9 +1295,6 @@ impl Tools {
 
 /// claude-code when it is offered here, else the first available harness.
 fn default_harness(harnesses: &[HarnessInfo]) -> anyhow::Result<HarnessId> {
-    if harnesses.is_empty() {
-        return Ok(HarnessId::ClaudeCode);
-    }
     harnesses
         .iter()
         .find(|h| h.id == HarnessId::ClaudeCode && h.available())
@@ -1031,6 +1323,10 @@ mod tests {
     #[derive(Default)]
     struct World {
         writes: Mutex<Vec<(String, Value)>>,
+        reads: Mutex<Vec<(String, Value)>>,
+        extra_devices: Mutex<Vec<Value>>,
+        extra_chats: Vec<Value>,
+        fail_create_chat: bool,
     }
 
     fn stream(item: Value) -> RpcReply {
@@ -1040,20 +1336,34 @@ mod tests {
     #[async_trait]
     impl RpcService for World {
         async fn handle(&self, method: &str, params: Value) -> Result<RpcReply, RpcError> {
+            if matches!(method, methods::LIST_HARNESSES | methods::LIST_MODELS) {
+                self.reads
+                    .lock()
+                    .unwrap()
+                    .push((method.into(), params.clone()));
+            }
             Ok(match method {
                 methods::LOCAL_DEVICE => RpcReply::Value(json!({ "deviceId": "dev-local" })),
                 methods::ENGINE_INFO => RpcReply::Value(json!({
                     "deviceId": "dev-local", "workspaceScope": "local"
                 })),
-                methods::WATCH_DEVICES => stream(json!([{
-                    "id": "dev-local", "name": "Laptop", "platform": "linux",
-                    "lastSeenAt": null
-                }])),
+                methods::WATCH_DEVICES => {
+                    let mut devices = json!([{
+                        "id": "dev-local", "name": "Laptop", "platform": "linux",
+                        "lastSeenAt": null
+                    }]);
+                    devices
+                        .as_array_mut()
+                        .unwrap()
+                        .extend(self.extra_devices.lock().unwrap().clone());
+                    stream(devices)
+                }
                 methods::WATCH_SPACES => stream(json!([{
                     "id": "space-1", "deviceId": "dev-local", "path": "/repo/comet",
                     "gitDetected": true, "createdAt": "2026-09-01T00:00:00Z"
                 }])),
-                methods::WATCH_CHATS => stream(json!([
+                methods::WATCH_CHATS => {
+                    let mut chats = json!([
                     {
                         "id": "chat-alpha-1", "deviceId": "dev-local", "title": "Alpha",
                         "archived": false, "spaceId": "space-1",
@@ -1065,7 +1375,13 @@ mod tests {
                         "archived": false, "spaceId": "space-1",
                         "createdAt": "2026-09-02T00:00:00Z"
                     }
-                ])),
+                    ]);
+                    chats
+                        .as_array_mut()
+                        .unwrap()
+                        .extend(self.extra_chats.clone());
+                    stream(chats)
+                }
                 methods::WATCH_SESSIONS => stream(json!([])),
                 methods::LIST_HARNESSES => RpcReply::Value(json!([
                     { "id": "claude-code", "name": "Claude Code", "supportsSteering": true,
@@ -1083,7 +1399,67 @@ mod tests {
                       "status": "complete",
                       "parts": [{ "kind": "text", "id": "t", "text": "hello back" }] }
                 ]})),
-                methods::MUTATE | methods::QUEUE_COMMAND | methods::QUEUE_MESSAGE => {
+                methods::CLOUD_PROVISION => {
+                    self.writes
+                        .lock()
+                        .unwrap()
+                        .push((method.to_owned(), params.clone()));
+                    RpcReply::Value(json!({
+                        "deviceId": "dev-cloud-new",
+                        "chatId": params["chatId"],
+                        "state": "provisioning",
+                        "generation": 1,
+                    }))
+                }
+                methods::CLOUD_MACHINE => {
+                    self.writes
+                        .lock()
+                        .unwrap()
+                        .push((method.to_owned(), params.clone()));
+                    let action = params["action"].as_str().unwrap_or("");
+                    let id = params["deviceId"].as_str().unwrap_or("");
+                    let mut devices = self.extra_devices.lock().unwrap();
+                    for device in devices.iter_mut() {
+                        if device["id"] == id {
+                            match action {
+                                "wake" => {
+                                    device["cloud"]["state"] = json!("running");
+                                    device["lastSeenAt"] = json!(chrono::Utc::now());
+                                }
+                                "stop" => {
+                                    device["cloud"]["state"] = json!("stopped");
+                                    device["lastSeenAt"] = Value::Null;
+                                }
+                                "discard" => {
+                                    device["cloud"]["state"] = json!("stopped");
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    RpcReply::Value(json!({
+                        "deviceId": id,
+                        "chatId": "chat-cloud-1",
+                        "state": match action {
+                            "wake" => "resuming",
+                            "stop" => "stopping",
+                            "discard" => "stopped",
+                            _ => "error",
+                        },
+                        "generation": 1,
+                    }))
+                }
+                methods::MUTATE => {
+                    self.writes
+                        .lock()
+                        .unwrap()
+                        .push((method.to_owned(), params.clone()));
+                    if self.fail_create_chat && params["op"] == "createChat" {
+                        return Err(RpcError::Failed("createChat failed".into()));
+                    }
+                    RpcReply::Value(json!({ "ok": true }))
+                }
+                methods::QUEUE_COMMAND | methods::QUEUE_MESSAGE => {
                     self.writes
                         .lock()
                         .unwrap()
@@ -1324,6 +1700,230 @@ mod tests {
         assert_eq!(
             whoami["result"]["structuredContent"]["localDeviceId"],
             "dev-local"
+        );
+        let instructions = init["result"]["instructions"].as_str().unwrap();
+        assert!(instructions.contains("kind: cloud"), "{instructions}");
+        assert!(
+            catalog().iter().any(|d| d.name == "cloud_machine"),
+            "cloud_machine must be in the catalog"
+        );
+    }
+
+    fn cloud_world() -> Arc<World> {
+        Arc::new(World {
+            extra_devices: Mutex::new(vec![json!({
+                "id": "dev-cloud-1",
+                "name": "Boat",
+                "platform": "linux",
+                "lastSeenAt": null,
+                "cloud": {
+                    "provider": "boat",
+                    "state": "stopped",
+                    "chatId": "chat-cloud-1",
+                    "generation": 1,
+                    "error": null
+                }
+            })]),
+            extra_chats: vec![json!({
+                "id": "chat-cloud-1",
+                "deviceId": "dev-cloud-1",
+                "title": "Cloud Alpha",
+                "archived": false,
+                "cwd": "~/.zeron/scratch/2026-09-03-d1",
+                "config": {
+                    "harness": "claude-code",
+                    "model": "opus",
+                    "reasoning": null,
+                    "sandbox": "workspace-write"
+                },
+                "createdAt": "2026-09-03T00:00:00Z"
+            })],
+            ..World::default()
+        })
+    }
+
+    #[tokio::test]
+    async fn create_chat_kind_cloud_provisions_then_creates_the_same_id() {
+        let world = Arc::new(World::default());
+        let tools = tools(world.clone(), Origin::default());
+        let created = tools
+            .call(
+                "create_chat",
+                json!({
+                    "kind": "cloud",
+                    "title": "Boat",
+                    "prompt": "hello cloud"
+                }),
+            )
+            .await
+            .unwrap();
+        let chat_id = created["chatId"].as_str().unwrap().to_owned();
+        assert_eq!(created["kind"], "cloud");
+        assert_eq!(created["deviceId"], "dev-cloud-new");
+        assert!(created["parentChatId"].is_null());
+        assert_eq!(created["harness"], "claude-code");
+        assert_eq!(created["cloud"]["state"], "provisioning");
+
+        let writes = world.writes.lock().unwrap();
+        assert_eq!(writes[0].0, methods::CLOUD_PROVISION);
+        assert_eq!(writes[0].1["chatId"], chat_id);
+        assert_eq!(writes[1].0, methods::MUTATE);
+        assert_eq!(writes[1].1["op"], "createChat");
+        assert_eq!(writes[1].1["chatId"], chat_id);
+        assert_eq!(writes[1].1["deviceId"], "dev-cloud-new");
+        assert!(
+            writes[1].1["cwd"]
+                .as_str()
+                .unwrap()
+                .starts_with("~/.zeron/scratch/"),
+            "{}",
+            writes[1].1["cwd"]
+        );
+        assert!(writes[1].1.get("spaceId").is_none());
+        assert!(writes[1].1.get("parentChatId").is_none());
+        assert_eq!(writes[2].1["op"], "renameChat");
+        assert_eq!(writes[3].0, methods::QUEUE_COMMAND);
+        assert!(
+            world.reads.lock().unwrap().is_empty(),
+            "cloud create must not query the host catalog"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_chat_kind_cloud_refuses_device_parent_project_and_cwd() {
+        let world = Arc::new(World::default());
+        let tools = tools(world, Origin::default());
+        for args in [
+            json!({ "kind": "cloud", "device": "Laptop" }),
+            json!({ "kind": "cloud", "parent": "Alpha" }),
+            json!({ "kind": "cloud", "project": "comet" }),
+            json!({ "kind": "cloud", "cwd": "/tmp" }),
+        ] {
+            let err = tools.call("create_chat", args.clone()).await.unwrap_err();
+            assert!(err.contains("kind cloud cannot"), "{err} for {args}");
+        }
+    }
+
+    #[tokio::test]
+    async fn create_chat_kind_cloud_discards_the_machine_when_create_fails() {
+        let world = Arc::new(World {
+            fail_create_chat: true,
+            ..World::default()
+        });
+        let tools = tools(world.clone(), Origin::default());
+        let err = tools
+            .call("create_chat", json!({ "kind": "cloud" }))
+            .await
+            .unwrap_err();
+        assert!(err.contains("discarded the machine"), "{err}");
+        let writes = world.writes.lock().unwrap();
+        assert_eq!(writes[0].0, methods::CLOUD_PROVISION);
+        assert_eq!(writes[1].0, methods::MUTATE);
+        assert_eq!(writes[1].1["op"], "createChat");
+        assert_eq!(writes[2].0, methods::CLOUD_MACHINE);
+        assert_eq!(writes[2].1["action"], "discard");
+        assert_eq!(writes[2].1["deviceId"], "dev-cloud-new");
+        assert_eq!(writes.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn send_message_to_a_cloud_chat_skips_host_catalog() {
+        let world = cloud_world();
+        let tools = tools(world.clone(), Origin::default());
+        let sent = tools
+            .call(
+                "send_message",
+                json!({ "chat": "Cloud Alpha", "text": "wake up" }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(sent["sent"]["delivery"], "run");
+        assert!(
+            world.reads.lock().unwrap().is_empty(),
+            "a sleeping cloud host cannot answer ListHarnesses"
+        );
+        let writes = world.writes.lock().unwrap();
+        let (method, params) = writes.last().expect("queued command");
+        assert_eq!(method, methods::QUEUE_COMMAND);
+        assert_eq!(params["chatId"], "chat-cloud-1");
+        assert_eq!(params["command"]["request"]["harness"], "claude-code");
+        assert_eq!(params["command"]["request"]["model"], "opus");
+    }
+
+    #[tokio::test]
+    async fn list_devices_and_get_chat_include_cloud() {
+        let world = cloud_world();
+        let tools = tools(world, Origin::default());
+        let listed = tools.call("list_devices", json!({})).await.unwrap();
+        assert!(listed["devices"][0].get("cloud").is_none());
+        let boat = listed["devices"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|d| d["id"] == "dev-cloud-1")
+            .unwrap();
+        assert_eq!(boat["cloud"]["provider"], "boat");
+        assert_eq!(boat["cloud"]["state"], "stopped");
+        assert_eq!(boat["cloud"]["chatId"], "chat-cloud-1");
+        assert_eq!(boat["cloud"]["shortLabel"], "Cloud · asleep");
+        assert_eq!(boat["cloud"]["recreated"], false);
+
+        let chat = tools
+            .call("get_chat", json!({ "chat": "Cloud Alpha" }))
+            .await
+            .unwrap();
+        assert_eq!(chat["id"], "chat-cloud-1");
+        assert_eq!(chat["cloud"]["state"], "stopped");
+        assert_eq!(
+            chat["cloud"]["statusLabel"],
+            "Cloud machine asleep · wakes on send"
+        );
+    }
+
+    #[tokio::test]
+    async fn cloud_machine_resolves_by_device_name_and_chat_title() {
+        let world = cloud_world();
+        let tools = tools(world.clone(), Origin::default());
+        let woke = tools
+            .call(
+                "cloud_machine",
+                json!({ "action": "wake", "device": "Boat" }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(woke["deviceId"], "dev-cloud-1");
+        assert_eq!(woke["action"], "wake");
+        assert_eq!(woke["machine"]["state"], "resuming");
+
+        let stopped = tools
+            .call(
+                "cloud_machine",
+                json!({ "action": "stop", "chat": "Cloud Alpha" }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(stopped["deviceId"], "dev-cloud-1");
+        assert_eq!(stopped["action"], "stop");
+
+        let discarded = tools
+            .call(
+                "cloud_machine",
+                json!({ "action": "discard", "chat": "chat-cloud" }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(discarded["action"], "discard");
+        let writes = world.writes.lock().unwrap();
+        assert_eq!(
+            writes
+                .iter()
+                .map(|(method, params)| (method.as_str(), params["action"].as_str().unwrap()))
+                .collect::<Vec<_>>(),
+            vec![
+                (methods::CLOUD_MACHINE, "wake"),
+                (methods::CLOUD_MACHINE, "stop"),
+                (methods::CLOUD_MACHINE, "discard"),
+            ]
         );
     }
 }

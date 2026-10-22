@@ -713,7 +713,7 @@ impl RegistryDoc {
 
     /// Upsert a full device row (writer discipline: callers pass their OWN device).
     pub fn upsert_device(&mut self, device: &Device) -> Result<(), DocError> {
-        let set = fields([
+        let mut set = fields([
             ("id", json!(device.id)),
             ("name", json!(device.name)),
             ("platform", json!(device.platform)),
@@ -727,6 +727,14 @@ impl RegistryDoc {
             ("cursorSdkEngineVersion", opt_str(device.version.as_deref())),
             ("capabilities", json!(device.capabilities)),
         ]);
+        if let Some(cloud) = &device.cloud {
+            set.insert("cloud".into(), json!(cloud));
+            set.insert("cloudProvider".into(), json!(cloud.provider));
+            set.insert("cloudState".into(), json!(cloud.state));
+            set.insert("cloudChatId".into(), json!(cloud.chat_id));
+            set.insert("cloudGeneration".into(), json!(cloud.generation));
+            set.insert("cloudError".into(), json!(cloud.error));
+        }
         self.write(KIND_DEVICES, &device.id.clone(), OpKind::Upsert, set);
         Ok(())
     }
@@ -1256,25 +1264,29 @@ impl RegistryDoc {
         };
         for device in &state.devices {
             let ms = newest(&[device.last_seen_at, device.created_at]);
-            seed(
-                KIND_DEVICES,
-                &device.id,
-                ms,
-                fields([
-                    ("id", json!(device.id)),
-                    ("name", json!(device.name)),
-                    ("platform", json!(device.platform)),
-                    ("lastSeenAt", opt_ms(device.last_seen_at)),
-                    ("createdAt", opt_ms(device.created_at)),
-                    ("version", opt_str(device.version.as_deref())),
-                    (
-                        "cursorSdkVersion",
-                        opt_str(device.cursor_sdk_version.as_deref()),
-                    ),
-                    ("cursorSdkEngineVersion", opt_str(device.version.as_deref())),
-                    ("capabilities", json!(device.capabilities)),
-                ]),
-            );
+            let mut set = fields([
+                ("id", json!(device.id)),
+                ("name", json!(device.name)),
+                ("platform", json!(device.platform)),
+                ("lastSeenAt", opt_ms(device.last_seen_at)),
+                ("createdAt", opt_ms(device.created_at)),
+                ("version", opt_str(device.version.as_deref())),
+                (
+                    "cursorSdkVersion",
+                    opt_str(device.cursor_sdk_version.as_deref()),
+                ),
+                ("cursorSdkEngineVersion", opt_str(device.version.as_deref())),
+                ("capabilities", json!(device.capabilities)),
+            ]);
+            if let Some(cloud) = &device.cloud {
+                set.insert("cloud".into(), json!(cloud));
+                set.insert("cloudProvider".into(), json!(cloud.provider));
+                set.insert("cloudState".into(), json!(cloud.state));
+                set.insert("cloudChatId".into(), json!(cloud.chat_id));
+                set.insert("cloudGeneration".into(), json!(cloud.generation));
+                set.insert("cloudError".into(), json!(cloud.error));
+            }
+            seed(KIND_DEVICES, &device.id, ms, set);
         }
         for space in &state.spaces {
             let ms = newest(&[space.git_checked_at, Some(space.created_at)]);
